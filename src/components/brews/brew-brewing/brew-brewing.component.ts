@@ -6,6 +6,7 @@ import {
   EventEmitter,
   HostListener,
   Input,
+  NgZone,
   OnInit,
   Output,
   ViewChild,
@@ -160,6 +161,9 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
 
   public preparationDevice: XeniaDevice = undefined;
 
+  private pressureThresholdWasHit: boolean = false;
+  private temperatureThresholdWasHit: boolean = false;
+
   constructor(
     private readonly platform: Platform,
     private readonly uiSettingsStorage: UISettingsStorage,
@@ -178,7 +182,8 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
     private readonly uiFileHelper: UIFileHelper,
     private readonly screenOrientation: ScreenOrientation,
     private readonly uiAlert: UIAlert,
-    private readonly uiPreparationHelper: UIPreparationHelper
+    private readonly uiPreparationHelper: UIPreparationHelper,
+    private readonly ngZone: NgZone
   ) {}
 
   public getActivePreparationTools() {
@@ -404,6 +409,11 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
   }
 
   public async maximizeFlowGraph() {
+    if (this.maximizeFlowGraphIsShown === true) {
+      return;
+    }
+    this.maximizeFlowGraphIsShown = true;
+
     let actualOrientation;
     if (this.platform.is('cordova')) {
       actualOrientation = this.screenOrientation.type;
@@ -431,7 +441,6 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
         brewTemperatureGraphEvent: this.brewTemperatureGraphSubject,
       },
     });
-    this.maximizeFlowGraphIsShown = true;
 
     // will force rerender :D
     this.lastChartRenderingInstance = -1;
@@ -610,6 +619,7 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
   public attachToPressureChange() {
     const pressureDevice: PressureDevice = this.bleManager.getPressureDevice();
     if (pressureDevice) {
+      this.pressureThresholdWasHit = false;
       this.deattachToPressureChange();
 
       const isEspressoBrew: boolean =
@@ -621,7 +631,6 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
       this.pressureDeviceSubscription = pressureDevice.pressureChange.subscribe(
         (_val) => {
           const actual: number = _val.actual;
-          const old: number = _val.old;
           //Reset to 0, as a temporary fix to exclude the "451" bar
           if (actual > 15) {
             _val.actual = 0;
@@ -630,11 +639,20 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
             this.__setPressureFlow(_val);
           } else {
             if (
+              this.pressureThresholdWasHit === false &&
               this.settings.pressure_threshold_active &&
-              _val.actual > this.settings.pressure_threshold_bar
+              _val.actual >= this.settings.pressure_threshold_bar
             ) {
-              this.timer.startTimer();
-              this.checkChanges();
+              this.pressureThresholdWasHit = true;
+              this.ngZone.run(() => {
+                this.timerStartPressed(undefined);
+
+                setTimeout(() => {
+                  this.changeDetectorRef.markForCheck();
+                  this.timer.checkChanges();
+                  this.checkChanges();
+                });
+              });
             }
           }
         }
@@ -646,21 +664,29 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
     const temperatureDevice: TemperatureDevice =
       this.bleManager.getTemperatureDevice();
     if (temperatureDevice) {
+      this.temperatureThresholdWasHit = false;
       this.deattachToTemperatureChange();
 
       this.temperatureDeviceSubscription =
         temperatureDevice.temperatureChange.subscribe((_val) => {
-          const actual: number = _val.actual;
-          const old: number = _val.old;
           if (this.timer.isTimerRunning()) {
             this.__setTemperatureFlow(_val);
           } else {
             if (
+              this.temperatureThresholdWasHit === false &&
               this.settings.temperature_threshold_active &&
-              _val.actual > this.settings.temperature_threshold_temp
+              _val.actual >= this.settings.temperature_threshold_temp
             ) {
-              this.timer.startTimer();
-              this.checkChanges();
+              this.temperatureThresholdWasHit = true;
+              this.ngZone.run(() => {
+                this.timerStartPressed(undefined);
+
+                setTimeout(() => {
+                  this.changeDetectorRef.markForCheck();
+                  this.timer.checkChanges();
+                  this.checkChanges();
+                });
+              });
             }
           }
         });
@@ -890,7 +916,19 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
         // If maximizeFlowGraphIsShown===true, we already started once and resetted, don't show overlay again
         // First maximize, then go on with the timer, else it will lag hard.
 
-        this.maximizeFlowGraph();
+        if (scale || temperatureDevice) {
+          this.maximizeFlowGraph();
+        } else {
+          if (
+            this.data.getPreparation().style_type ===
+              PREPARATION_STYLE_TYPE.ESPRESSO &&
+            pressureDevice
+          ) {
+            this.maximizeFlowGraph();
+          } else {
+            //Don't maximize because pressure is connected, but preparation is not right
+          }
+        }
       }
 
       if (scale) {
@@ -909,7 +947,8 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
           }, this.settings.bluetooth_command_delay);
         });
       }
-      if (pressureDevice) {
+      if (pressureDevice && this.settings.pressure_threshold_active === false) {
+        // Just update to zero if there is no threshold active
         pressureDevice.updateZero();
       }
 
@@ -926,10 +965,13 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
         this.attachToScaleWeightChange();
         this.attachToFlowChange();
       }
-      if (pressureDevice) {
+      if (pressureDevice && this.settings.pressure_threshold_active === false) {
         this.attachToPressureChange();
       }
-      if (temperatureDevice) {
+      if (
+        temperatureDevice &&
+        this.settings.temperature_threshold_active === false
+      ) {
         this.attachToTemperatureChange();
       }
     }
@@ -1147,10 +1189,18 @@ export class BrewBrewingComponent implements OnInit, AfterViewInit {
 
       if (pressureDevice) {
         this.deattachToPressureChange();
+        if (this.settings.pressure_threshold_active === true) {
+          // After attaching attach again
+          this.attachToPressureChange();
+        }
       }
 
       if (temperatureDevice) {
         this.deattachToTemperatureChange();
+        if (this.settings.temperature_threshold_active === true) {
+          // After attaching attach again
+          this.attachToTemperatureChange();
+        }
       }
 
       if (this.isEdit) {
